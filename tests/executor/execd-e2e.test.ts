@@ -66,14 +66,23 @@ describe.skipIf(!socket)("execd end to end", () => {
   // trip work. `execute()` only calls `backend.detectRuntimes()` when the
   // picked backend is non-local (see the `runtimes = backend.kind ===
   // "local" ? this.#runtimes : await backend.detectRuntimes()` branch in
-  // executor.ts) — so the shell/javascript/python cases above already
-  // exercise the probe, but only as a side effect of needing SOME runtime.
-  // This case exercises it directly: `command -v sh` only succeeds if the
-  // probe script actually ran on the far side of the execd boundary and
-  // resolved `sh`, so a probe that silently returned an empty RuntimeMap
-  // (the failure path in ExecdBackend#probeRuntimes) would surface here as
-  // a thrown "No shell runtime available"-style error before `sh` was even
-  // reached, rather than a passing assertion.
+  // executor.ts), so every case in this file already sends a probe first.
+  //
+  // The javascript/python cases above are the strongest evidence that the
+  // probe worked: `buildCommand()` throws "No JavaScript/Python runtime
+  // available" when its RuntimeMap entry is null, and a wholly failed probe
+  // (ExecdBackend#probeRuntimes's catch branch) reports every language as
+  // null except `shell`, which defaults to the bareword "sh" — so those two
+  // cases would fail closed (a thrown error, not a passing assertion) if
+  // detection silently came back empty. `shell` can't reuse that "throws on
+  // null" property since it never throws, so this case checks something
+  // else about the same round trip instead: that the probe script the
+  // backend sends (`buildRuntimeProbeScript()`) is well-formed enough for
+  // the far-side shell to actually execute `command -v` and produce
+  // parseable output — a probe that came back garbled or truncated would
+  // most likely still resolve `runtimes.shell` to *something* (real or
+  // fallback), but this exercises the specific `command -v` line, not just
+  // "some shell ran".
   test("the probe itself resolves a runtime across the boundary", async () => {
     const r = await executor().execute({
       language: "shell", code: "command -v sh >/dev/null && echo found",

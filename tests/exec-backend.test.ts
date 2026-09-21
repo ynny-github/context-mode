@@ -4,7 +4,7 @@ import {
   quoteForPosixShell,
   quoteArgvAsCommandLine,
 } from "../src/shell-quote.js";
-import { LocalBackend } from "../src/exec-backend.js";
+import { LocalBackend, ExecdBackend, EXECD_TIMEOUT_GRACE_MS } from "../src/exec-backend.js";
 import type { ExecResult } from "../src/types.js";
 
 describe("quoteArgvAsCommandLine", () => {
@@ -135,5 +135,98 @@ describe("resolveBackendConfig", () => {
       CONTEXT_MODE_EXEC_BACKEND: "execd",
       AGENT_SANDBOX_EXECD_SOCKET: "",
     })).toThrow(/AGENT_SANDBOX_EXECD_SOCKET/);
+  });
+});
+
+describe("ExecdBackend.prepare", () => {
+  const backend = new ExecdBackend("/run/execd.sock");
+
+  test("wraps the argv as one quoted command line", () => {
+    expect(backend.prepare(["node", "/tmp/x.js"], undefined, false).argv)
+      .toEqual(["agent-sandbox", "exec", "--", "'node' '/tmp/x.js'"]);
+  });
+
+  test("passes the caller's timeout to execd in milliseconds", () => {
+    expect(backend.prepare(["node", "/tmp/x.js"], 3000, false).argv).toEqual([
+      "agent-sandbox", "exec", "--timeout", "3000ms", "--", "'node' '/tmp/x.js'",
+    ]);
+  });
+
+  test("omits --timeout entirely when the caller bounded nothing", () => {
+    expect(backend.prepare(["node"], undefined, false).argv)
+      .not.toContain("--timeout");
+  });
+
+  test("the local timer is the caller's timeout plus the drain grace", () => {
+    expect(backend.prepare(["node"], 3000, false).spawnTimeout)
+      .toBe(3000 + EXECD_TIMEOUT_GRACE_MS);
+  });
+
+  test("no caller timeout means no local timer either", () => {
+    expect(backend.prepare(["node"], undefined, false).spawnTimeout)
+      .toBeUndefined();
+  });
+
+  test("a path with a space cannot re-split the command line", () => {
+    expect(
+      backend.prepare(["/opt/my runtime/node", "/tmp/x.js"], undefined, false).argv[3],
+    ).toBe("'/opt/my runtime/node' '/tmp/x.js'");
+  });
+
+  // Backgrounding means "leave it running past the timeout". A server-side
+  // --timeout would tear the process down at exactly the moment we wanted to
+  // detach from it, so a backgrounded call carries no execd deadline at all.
+  test("a backgrounded call sends no --timeout to execd", () => {
+    expect(backend.prepare(["node"], 3000, true).argv)
+      .not.toContain("--timeout");
+  });
+
+  test("a backgrounded call keeps the local timer at the caller's timeout", () => {
+    expect(backend.prepare(["node"], 3000, true).spawnTimeout).toBe(3000);
+  });
+});
+
+describe("ExecdBackend.interpret", () => {
+  const backend = new ExecdBackend("/run/execd.sock");
+  const withCode = (exitCode: number) => ({
+    stdout: "", stderr: "", exitCode, timedOut: false,
+  });
+
+  // These two are the discriminator the design turns on: 124 is execd's
+  // timeout status, but a script may exit 124 on its own. The exit code alone
+  // therefore never decides it — the measured elapsed time does.
+  test("exit 124 at or past the deadline is a timeout", () => {
+    expect(backend.interpret(withCode(124), 3000, 3000).timedOut).toBe(true);
+  });
+
+  test("exit 124 before the deadline is the script's own status", () => {
+    expect(backend.interpret(withCode(124), 500, 3000).timedOut).toBe(false);
+  });
+
+  test("exit 124 with no deadline set is never a timeout", () => {
+    expect(backend.interpret(withCode(124), 999_999, undefined).timedOut)
+      .toBe(false);
+  });
+
+  test("a non-124 status is passed through even past the deadline", () => {
+    expect(backend.interpret(withCode(1), 9999, 3000).timedOut).toBe(false);
+  });
+
+  test("a timeout #spawn already detected is preserved", () => {
+    const raw = { stdout: "", stderr: "", exitCode: 1, timedOut: true };
+    expect(backend.interpret(raw, 9999, 3000).timedOut).toBe(true);
+  });
+
+  test("stdout and stderr are never rewritten", () => {
+    const raw = {
+      stdout: "data",
+      stderr: "agent-sandbox: refused: ...",
+      exitCode: 126,
+      timedOut: false,
+    };
+    const out = backend.interpret(raw, 10, 3000);
+    expect(out.stdout).toBe("data");
+    expect(out.stderr).toBe("agent-sandbox: refused: ...");
+    expect(out.exitCode).toBe(126);
   });
 });

@@ -1,5 +1,6 @@
 import { detectRuntimes, type RuntimeMap } from "./runtime.js";
 import type { ExecResult } from "./types.js";
+import { quoteArgvAsCommandLine } from "./shell-quote.js";
 
 /** What `PolyglotExecutor` should actually spawn, and under what timer. */
 export interface PreparedCommand {
@@ -111,4 +112,104 @@ export function resolveBackendConfig(env: NodeJS.ProcessEnv): BackendConfig {
     `${BACKEND_ENV_VAR}=${JSON.stringify(selected)} is not a known backend. ` +
     `Use "local" or "execd". Refusing to fall back to local execution.`,
   );
+}
+
+/**
+ * How much longer than execd's own deadline the local backstop waits.
+ *
+ * `agent-sandbox exec --timeout` documents that teardown starts at the
+ * deadline but the exit can lag it "by up to a couple of seconds while output
+ * drains". Five seconds clears that without leaving a genuinely hung request
+ * looking alive for long.
+ */
+export const EXECD_TIMEOUT_GRACE_MS = 5000;
+
+/** execd's timeout status, following GNU timeout(1). */
+export const EXECD_EXIT_TIMEOUT = 124;
+
+/**
+ * Runs each command through `agent-sandbox exec`, so it executes under the
+ * operator's nono command profile instead of this process's own sandbox.
+ *
+ * Nothing here decides whether a command is permitted. That is entirely the
+ * command profile's, and a refusal arrives as execd's exit status and its own
+ * stderr, both passed through untouched.
+ */
+export class ExecdBackend implements ExecBackend {
+  readonly kind = "execd" as const;
+
+  /**
+   * Held for diagnostics and to make the dependency explicit. The socket is
+   * not dialled here — `agent-sandbox exec` reads the same variable from the
+   * environment it inherits.
+   */
+  readonly socketPath: string;
+
+  constructor(socketPath: string) {
+    this.socketPath = socketPath;
+  }
+
+  prepare(
+    argv: string[],
+    timeout: number | undefined,
+    background: boolean,
+  ): PreparedCommand {
+    const line = quoteArgvAsCommandLine(argv);
+
+    // A backgrounded call must carry NO server-side deadline. `background`
+    // means "stop waiting at T but leave the process running"; --timeout T
+    // would have execd tear the process tree down at T instead, killing the
+    // very process the caller asked to keep. Teardown still works without it:
+    // cleanupBackgrounded() kills the client later, the connection drops, and
+    // execd treats that as a cancellation.
+    const bounded = timeout !== undefined && !background;
+    const wrapped = bounded
+      ? ["agent-sandbox", "exec", "--timeout", `${timeout}ms`, "--", line]
+      : ["agent-sandbox", "exec", "--", line];
+
+    return {
+      argv: wrapped,
+      // Bounded: execd owns the real deadline, ours is the backstop for an
+      // execd that never answers. Backgrounded: ours is the only timer, and
+      // it must fire on time, so no grace is added. Absent caller timeout
+      // stays absent on both sides.
+      spawnTimeout: timeout === undefined
+        ? undefined
+        : background
+          ? timeout
+          : timeout + EXECD_TIMEOUT_GRACE_MS,
+    };
+  }
+
+  interpret(
+    raw: ExecResult,
+    elapsedMs: number,
+    timeout: number | undefined,
+  ): ExecResult {
+    if (raw.timedOut) return raw;
+    // 124 is execd's timeout status, but a script can exit 124 by itself, so
+    // the status alone is not evidence. Pairing it with our own measured
+    // elapsed time makes this a check rather than a guess.
+    //
+    // Everything else is passed through verbatim. 2, 126, 127 and 128+signum
+    // are all values a real command can return, and execd's error frame is
+    // collapsed to exit 1 by `agent-sandbox exec` — so there is no sound way
+    // to tell a policy refusal from a script's own failure here. execd's
+    // stderr already says which it was; rewriting it would only obscure that.
+    if (
+      timeout !== undefined &&
+      raw.exitCode === EXECD_EXIT_TIMEOUT &&
+      elapsedMs >= timeout
+    ) {
+      return { ...raw, timedOut: true };
+    }
+    return raw;
+  }
+
+  detectRuntimes(): RuntimeMap {
+    // Replaced in a later task with detection performed through execd. Until
+    // then this is local detection, which is wrong for this backend but no
+    // more wrong than before this class existed.
+    return detectRuntimes();
+  }
 }

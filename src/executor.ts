@@ -9,7 +9,12 @@ import {
   type Language,
 } from "./runtime.js";
 import { quoteForPosixShell } from "./shell-quote.js";
-import { LocalBackend, type ExecBackend } from "./exec-backend.js";
+import {
+  LocalBackend,
+  ExecdBackend,
+  resolveBackendConfig,
+  type ExecBackend,
+} from "./exec-backend.js";
 export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
 
@@ -266,6 +271,12 @@ export class PolyglotExecutor {
     hardCapBytes?: number;
     projectRoot?: string | (() => string);
     runtimes?: RuntimeMap;
+    /**
+     * Environment the backend selection is read from. Injected rather than
+     * read from `process.env` so tests can exercise selection without
+     * mutating global state.
+     */
+    env?: NodeJS.ProcessEnv;
   }) {
     this.#hardCapBytes = opts?.hardCapBytes ?? 100 * 1024 * 1024; // 100MB
     const pr = opts?.projectRoot;
@@ -277,6 +288,12 @@ export class PolyglotExecutor {
       this.#projectRootResolver = () => process.cwd();
     }
     this.#runtimes = opts?.runtimes ?? detectRuntimes();
+
+    const backendConfig = resolveBackendConfig(opts?.env ?? process.env);
+    if (backendConfig.kind === "execd") {
+      this.#backends.execd = new ExecdBackend(backendConfig.socketPath);
+      this.#defaultBackend = "execd";
+    }
   }
 
   get #projectRoot(): string {

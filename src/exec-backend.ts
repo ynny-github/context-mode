@@ -18,7 +18,10 @@ export interface PreparedCommand {
  *
  * Both hooks are pure. `#spawn` stays the single process runner, so the
  * Windows shell handling, the output byte cap, background detach and
- * process-tree kill live in exactly one place regardless of backend.
+ * process-tree kill live in exactly one place regardless of backend. This
+ * governs `execute()`'s call to `#spawn`; `#compileAndRun`'s own `#spawn`
+ * call (for the compiled Rust binary) does not yet go through a backend —
+ * routing it through this seam is later work.
  */
 export interface ExecBackend {
   readonly kind: "local" | "execd";
@@ -58,7 +61,6 @@ export class LocalBackend implements ExecBackend {
   prepare(argv: string[], timeout: number | undefined): PreparedCommand {
     return { argv, spawnTimeout: timeout };
   }
-
 
   interpret(raw: ExecResult): ExecResult {
     return raw;

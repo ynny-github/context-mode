@@ -428,8 +428,10 @@ export class PolyglotExecutor {
   }
 
   /**
-   * prepare → spawn → interpret. The one path from an argv to an ExecResult,
-   * so a backend cannot be bypassed by a second spawn site.
+   * prepare → spawn → interpret. This is the path `execute()` uses to reach
+   * `#spawn`. `#compileAndRun`'s own `#spawn` call (for the compiled Rust
+   * binary) is a second, unguarded spawn site that does not yet go through a
+   * backend — routing it through this seam is later work.
    */
   async #runViaBackend(
     backend: ExecBackend,

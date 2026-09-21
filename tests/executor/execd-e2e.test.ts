@@ -51,11 +51,25 @@ describe.skipIf(!socket)("execd end to end", () => {
     expect(r.stdout.trim()).not.toContain(".ctx-mode-");
   });
 
+  // `r.timedOut` alone doesn't discriminate execd actually enforcing
+  // `--timeout` from execd ignoring it entirely: `#spawn`'s own local timer
+  // sets the identical `timedOut: true` if execd never answers and the
+  // 2000 + EXECD_TIMEOUT_GRACE_MS (5000) = 7000ms backstop fires instead —
+  // `ExecdBackend#interpret()` short-circuits on `if (raw.timedOut) return
+  // raw` before it ever gets to look at the exit code. So this also bounds
+  // the elapsed time: execd's own deadline is 2000ms, with "up to a couple
+  // of seconds" of documented drain lag on top (worst case ~4000ms);
+  // 6000ms sits above that with ~2s of margin while staying a full second
+  // below the 7000ms backstop, so a result that took 6s+ can only mean the
+  // local backstop fired, not execd's `--timeout`.
   test("a timeout is reported as a timeout", async () => {
+    const start = Date.now();
     const r = await executor().execute({
       language: "shell", code: "sleep 30", timeout: 2000,
     });
+    const elapsed = Date.now() - start;
     expect(r.timedOut).toBe(true);
+    expect(elapsed).toBeLessThan(6000);
   });
 
   // Not `executor().runtimes` — that getter returns the LOCAL map this
@@ -83,6 +97,17 @@ describe.skipIf(!socket)("execd end to end", () => {
   // most likely still resolve `runtimes.shell` to *something* (real or
   // fallback), but this exercises the specific `command -v` line, not just
   // "some shell ran".
+  //
+  // What this does NOT exercise: `>`, `&&`, and `/dev/null` here never pass
+  // through argv quoting. `buildCommand()`'s shell case returns
+  // `[runtimes.shell, filePath]` — only the shell binary and the script's
+  // *path* — and `ExecdBackend#prepare()` quotes exactly that two-element
+  // array. The metacharacters live in the script FILE's content, which the
+  // remote shell parses when it reads the file, not in anything
+  // `quoteArgvAsCommandLine` ever sees. So the residual value here over the
+  // plain "shell runs through execd" case above is narrower than it might
+  // look: it's "the remote shell parses ordinary control operators in a
+  // file it's given," not "quoting survives shell metacharacters."
   test("the probe itself resolves a runtime across the boundary", async () => {
     const r = await executor().execute({
       language: "shell", code: "command -v sh >/dev/null && echo found",

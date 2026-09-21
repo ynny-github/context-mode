@@ -106,7 +106,7 @@ export function buildPowerShellScriptContent(code: string): string {
  * os.tmpdir() reads TMPDIR from the environment, which some shells/tools
  * set to the project root — causing temp files to pollute the working tree.
  */
-const OS_TMPDIR = (() => {
+export const OS_TMPDIR = (() => {
   if (isWin) return process.env.TEMP ?? process.env.TMP ?? tmpdir();
   try {
     const result = execFileSync(
@@ -344,9 +344,13 @@ export class PolyglotExecutor {
       const filePath = this.#writeScript(tmpDir, code, language, backend.kind === "local");
       const cmd = buildCommand(this.#runtimes, language, filePath);
 
-      // Rust: compile then run
+      // Rust: compile then run. Assigned rather than returned — returning here
+      // skipped cleanupTmpDir below, leaving the source and the compiled
+      // binary in /tmp for the life of the machine.
       if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout);
+        const rustResult = await this.#compileAndRun(backend, filePath, tmpDir, timeout);
+        cleanupTmpDir(tmpDir);
+        return rustResult;
       }
 
       // Every language runs in the project directory so git, relative paths,
@@ -434,6 +438,7 @@ export class PolyglotExecutor {
   }
 
   async #compileAndRun(
+    backend: ExecBackend,
     srcPath: string,
     cwd: string,
     timeout: number | undefined,
@@ -441,35 +446,30 @@ export class PolyglotExecutor {
     const binSuffix = isWin ? ".exe" : "";
     const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
 
-    // Compile — cap rustc invocation at 60s when caller didn't bound the
-    // overall timeout (a hung compile shouldn't run forever even if the
-    // caller is fine with a long-running binary afterwards).
-    try {
-      execFileSync("rustc", [srcPath, "-o", binPath], {
-        cwd,
-        timeout: timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? (err as any).stderr || err.message : String(err);
-      return {
-        stdout: "",
-        stderr: `Compilation failed:\n${message}`,
-        exitCode: 1,
-        timedOut: false,
-      };
-    }
+    // Through the backend, not execFileSync: a compile that ran here while the
+    // binary ran on execd would put arbitrary code back in this process's
+    // sandbox — the split this backend exists to remove.
+    //
+    // The 60s cap when the caller bounded nothing is preserved: a hung rustc
+    // should not run forever even if the caller is content for the compiled
+    // binary to.
+    const compile = await this.#runViaBackend(
+      backend,
+      ["rustc", srcPath, "-o", binPath],
+      cwd,
+      cwd,
+      timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
+    );
+    if (compile.exitCode !== 0) return compile;
 
-    // Run
-    return this.#spawn([binPath], cwd, cwd, timeout);
+    return this.#runViaBackend(backend, [binPath], cwd, cwd, timeout);
   }
 
   /**
    * prepare → spawn → interpret. This is the path `execute()` uses to reach
-   * `#spawn`. `#compileAndRun`'s own `#spawn` call (for the compiled Rust
-   * binary) is a second, unguarded spawn site that does not yet go through a
-   * backend — routing it through this seam is later work.
+   * `#spawn`. `#compileAndRun` now reuses this same seam for both the compile
+   * step and the compiled binary, rather than calling `#spawn` (or
+   * `execFileSync`) directly.
    */
   async #runViaBackend(
     backend: ExecBackend,

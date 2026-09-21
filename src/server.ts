@@ -3321,6 +3321,11 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
       language: "javascript",
       code: fetchCode,
       timeout: 30_000,
+      // Deliberate exemption, agreed in the design: ctx_fetch_and_index keeps
+      // its network egress on the agent sandbox's grants rather than the
+      // command profile's allow_domain list. This is a knowingly-open hole,
+      // exempted for scope — see docs/superpowers/specs/2026-09-21-exec-backend-design.md.
+      backendOverride: "local",
     });
     if (result.exitCode !== 0) {
       // Subprocess fetch failure — undici / fetch can surface EAI_AGAIN /

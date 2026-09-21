@@ -1,5 +1,6 @@
 import { describe, test, expect } from "vitest";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import {
   quoteForPosixShell,
   quoteArgvAsCommandLine,
@@ -249,5 +250,53 @@ describe("PATH injection", () => {
   test("existing three-argument callers keep the injection", () => {
     expect(buildShellScriptContent("echo hi", "/usr/bin", "linux"))
       .toContain("export PATH=");
+  });
+});
+
+describe("backendOverride containment", () => {
+  // The exemption is deliberate but it is still a hole: ctx_fetch_and_index
+  // performs agent-supplied network egress with the agent sandbox's grants.
+  // One call site is the whole of it, and growth must be noticed here rather
+  // than in a review six months from now.
+  test("exactly one production call site sets backendOverride", () => {
+    const sources = [
+      "src/server.ts",
+      "src/executor.ts",
+      "src/cli.ts",
+    ].map(p => readFileSync(p, "utf-8"));
+    const uses = sources.join("\n").split("\n")
+      .filter(l => l.includes("backendOverride:"));
+    expect(uses.length).toBe(1);
+    expect(uses[0]).toContain('"local"');
+  });
+
+  test("backendOverride is not advertised in any MCP tool schema", () => {
+    // An agent able to name its own backend could choose "local" and step
+    // around the sandbox, so this must never reach a tool's input schema.
+    //
+    // Tool schemas in this codebase are built with Zod (`z.object({ ... })`,
+    // fields like `z.string()`/`z.enum([...])`), not hand-written JSON
+    // Schema literals — a plain grep for `backendOverride` + `type:` would
+    // never match a Zod field declaration and would pass even if someone
+    // added `backendOverride: z.enum(["local"]).optional()` to a tool's
+    // inputSchema. So this checks every source line that mentions the
+    // property and requires each one to be either the sanctioned call site
+    // (`backendOverride: "local"`, a plain string literal, not a validator
+    // call) or a comment — never a schema field declaration.
+    const server = readFileSync("src/server.ts", "utf-8");
+    const mentions = server.split("\n").filter(l => l.includes("backendOverride"));
+    expect(mentions.length).toBeGreaterThan(0); // sanity: the property exists at all
+
+    for (const line of mentions) {
+      const trimmed = line.trim();
+      const isComment = trimmed.startsWith("//") || trimmed.startsWith("*");
+      const isSanctionedCallSite = /backendOverride:\s*"local"\s*,?\s*$/.test(trimmed);
+      expect(isComment || isSanctionedCallSite).toBe(true);
+    }
+
+    // Explicit belt-and-suspenders: no Zod validator (or any function call)
+    // is ever attached to the key — that would mean it became a schema field.
+    const schemaFieldPattern = /backendOverride\s*:\s*z\.\w+\(/;
+    expect(server.split("\n").some(l => schemaFieldPattern.test(l))).toBe(false);
   });
 });

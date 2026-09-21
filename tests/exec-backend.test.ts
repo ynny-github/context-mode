@@ -5,6 +5,7 @@ import {
   quoteArgvAsCommandLine,
 } from "../src/shell-quote.js";
 import { LocalBackend, ExecdBackend, EXECD_TIMEOUT_GRACE_MS } from "../src/exec-backend.js";
+import { buildShellScriptContent } from "../src/executor.js";
 import type { ExecResult } from "../src/types.js";
 
 describe("quoteArgvAsCommandLine", () => {
@@ -228,5 +229,25 @@ describe("ExecdBackend.interpret", () => {
     expect(out.stdout).toBe("data");
     expect(out.stderr).toBe("agent-sandbox: refused: ...");
     expect(out.exitCode).toBe(126);
+  });
+});
+
+describe("PATH injection", () => {
+  test("the PATH line is written when this process's PATH applies", () => {
+    expect(buildShellScriptContent("echo hi", "/usr/bin", "linux", true))
+      .toBe("export PATH='/usr/bin'\necho hi");
+  });
+
+  // Under ExecdBackend the script runs on the far side of the boundary, where
+  // the command profile decides the environment. Exporting our PATH there
+  // writes a value describing the wrong machine.
+  test("the PATH line is omitted when it does not", () => {
+    expect(buildShellScriptContent("echo hi", "/usr/bin", "linux", false))
+      .toBe("echo hi");
+  });
+
+  test("existing three-argument callers keep the injection", () => {
+    expect(buildShellScriptContent("echo hi", "/usr/bin", "linux"))
+      .toContain("export PATH=");
   });
 });

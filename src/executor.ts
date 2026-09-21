@@ -72,8 +72,15 @@ export function buildShellScriptContent(
   code: string,
   inheritedPath: string | undefined,
   platform: NodeJS.Platform,
+  /**
+   * Whether this process's PATH describes the environment the script will run
+   * in. False under ExecdBackend: the script executes on the far side of the
+   * sandbox boundary, where the command profile decides the environment, so
+   * exporting our PATH there writes a value about the wrong machine.
+   */
+  injectPath = true,
 ): string {
-  if (platform === "win32" || !inheritedPath) return code;
+  if (platform === "win32" || !inheritedPath || !injectPath) return code;
   return `export PATH=${quoteForPosixShell(inheritedPath)}\n${code}`;
 }
 
@@ -225,6 +232,19 @@ interface ExecuteOptions {
    * a non-project cwd (e.g. $HOME).
    */
   cwd?: string;
+  /**
+   * Force this one call onto the local backend, regardless of configuration.
+   *
+   * The value domain is "local" alone, deliberately: this can only route AWAY
+   * from execd, never force it on. It exists for ctx_fetch_and_index, whose
+   * HTTP fetch runs as a spawned script and would otherwise be bound by the
+   * command profile's network policy — outside this feature's agreed scope.
+   *
+   * It is NOT part of any MCP tool's input schema and must never become one.
+   * An agent that could name its own backend could choose "local" and step
+   * around the sandbox entirely.
+   */
+  backendOverride?: "local";
 }
 
 interface ExecuteFileOptions extends ExecuteOptions {
@@ -320,7 +340,8 @@ export class PolyglotExecutor {
     const tmpDir = mkdtempSync(join(OS_TMPDIR, ".ctx-mode-"));
 
     try {
-      const filePath = this.#writeScript(tmpDir, code, language);
+      const backend = this.#pickBackend(opts.backendOverride);
+      const filePath = this.#writeScript(tmpDir, code, language, backend.kind === "local");
       const cmd = buildCommand(this.#runtimes, language, filePath);
 
       // Rust: compile then run
@@ -341,7 +362,7 @@ export class PolyglotExecutor {
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
       const result = await this.#runViaBackend(
-        this.#pickBackend(), cmd, cwd, tmpDir, timeout, background,
+        backend, cmd, cwd, tmpDir, timeout, background,
       );
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
@@ -367,7 +388,7 @@ export class PolyglotExecutor {
     return this.execute({ language, code: wrappedCode, timeout });
   }
 
-  #writeScript(tmpDir: string, code: string, language: Language): string {
+  #writeScript(tmpDir: string, code: string, language: Language, injectPath: boolean): string {
     // Go needs a main package wrapper if not present
     if (language === "go" && !code.includes("package ")) {
       code = `package main\n\nimport "fmt"\n\nfunc main() {\n${code}\n}\n`;
@@ -403,7 +424,7 @@ export class PolyglotExecutor {
         : rewritten;
       writeFileSync(
         fp,
-        buildShellScriptContent(shellCode, process.env.PATH, process.platform),
+        buildShellScriptContent(shellCode, process.env.PATH, process.platform, injectPath),
         { encoding: "utf-8", mode: 0o700 },
       );
     } else {

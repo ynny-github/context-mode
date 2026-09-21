@@ -347,7 +347,7 @@ export class PolyglotExecutor {
       // the backend's own map, resolved before the script is written.
       const runtimes = backend.kind === "local"
         ? this.#runtimes
-        : backend.detectRuntimes();
+        : await backend.detectRuntimes();
       const filePath = this.#writeScript(
         tmpDir, code, language, backend.kind === "local", runtimes,
       );

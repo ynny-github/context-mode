@@ -1,7 +1,16 @@
-import { execFileSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { detectRuntimes, type RuntimeMap } from "./runtime.js";
 import type { ExecResult } from "./types.js";
 import { quoteArgvAsCommandLine } from "./shell-quote.js";
+
+// Promisified so `ExecdBackend.detectRuntimes()` can probe without blocking
+// the event loop. `execFileSync` (the Task 8 original) is synchronous and
+// single-threaded Node has no other thread to serve other MCP tool calls
+// while it waits — a slow or hung `agent-sandbox exec` would freeze the
+// entire process for up to its 30s bound, including tools (ctx_search,
+// ctx_index, …) that need execd for nothing at all.
+const execFileAsync = promisify(execFile);
 
 /** What `PolyglotExecutor` should actually spawn, and under what timer. */
 export interface PreparedCommand {
@@ -49,8 +58,13 @@ export interface ExecBackend {
     elapsedMs: number,
     timeout: number | undefined,
   ): ExecResult;
-  /** Detect runtimes where this backend actually executes. */
-  detectRuntimes(): RuntimeMap;
+  /**
+   * Detect runtimes where this backend actually executes. Async because a
+   * backend that probes over a socket/process boundary (ExecdBackend) must
+   * not block the event loop while it waits — see the note on
+   * `execFileAsync` above.
+   */
+  detectRuntimes(): Promise<RuntimeMap>;
 }
 
 /** Today's behaviour: spawn the argv as given, in this process's sandbox. */
@@ -68,7 +82,12 @@ export class LocalBackend implements ExecBackend {
     return raw;
   }
 
-  detectRuntimes(): RuntimeMap {
+  // Never actually called in the hot path — execute() uses its own
+  // constructor-injected snapshot for the local backend and only calls
+  // through the interface for a non-local one — but implemented for
+  // interface conformance and for anything that queries a LocalBackend
+  // directly.
+  async detectRuntimes(): Promise<RuntimeMap> {
     return detectRuntimes();
   }
 }
@@ -129,9 +148,22 @@ export const EXECD_TIMEOUT_GRACE_MS = 5000;
 export const EXECD_EXIT_TIMEOUT = 124;
 
 /**
- * The commands each language is satisfied by, in preference order. Mirrors
- * `buildCommand()`'s expectations in src/runtime.ts: the first name that
- * resolves wins, and the resolved absolute path becomes the runtime.
+ * The commands each language is satisfied by, in preference order: the first
+ * name that resolves wins, and the resolved absolute path becomes the
+ * runtime — the same rule `buildCommand()` in src/runtime.ts applies.
+ *
+ * This is deliberately *not* a full mirror of local detection
+ * (`detectRuntimes()` in src/runtime.ts). Two things local detection honours
+ * are left out on purpose, not by oversight:
+ *
+ * - `$SHELL`: local detection lets the user's `$SHELL` override the shell
+ *   candidate. That variable describes the *agent sandbox's* environment —
+ *   using it to pick the shell on the far side of the execd boundary would be
+ *   wrong for exactly the reason PATH injection was wrong in Task 6: it's a
+ *   fact about the wrong machine.
+ * - `py`: local detection's Windows Python launcher fallback. execd targets a
+ *   nono/Linux command sandbox, where `py` doesn't exist and couldn't mean
+ *   anything.
  */
 const EXECD_PROBE_TARGETS: Array<[keyof RuntimeMap, string[]]> = [
   ["javascript", ["bun", "node"]],
@@ -143,7 +175,7 @@ const EXECD_PROBE_TARGETS: Array<[keyof RuntimeMap, string[]]> = [
   ["rust", ["rustc"]],
   ["php", ["php"]],
   ["perl", ["perl"]],
-  ["r", ["Rscript"]],
+  ["r", ["Rscript", "r"]],
   ["elixir", ["elixir"]],
   ["csharp", ["dotnet-script"]],
 ];
@@ -177,9 +209,15 @@ function emptyRuntimeMap(): RuntimeMap {
 export function parseRuntimeProbeOutput(stdout: string): RuntimeMap {
   const map = emptyRuntimeMap();
   for (const line of stdout.split("\n")) {
-    const [language, path] = line.split("\t");
+    // Trim both parts — a stray `\r` (CRLF probe output) would otherwise end
+    // up embedded in the resolved path and silently break that runtime.
+    const [language, path] = line.split("\t").map(s => s.trim());
     if (!language || !path) continue;
-    if (language in map) (map as unknown as Record<string, unknown>)[language] = path;
+    // hasOwnProperty rather than `in`: RuntimeMap has no prototype chain
+    // worth walking, but this is the defensible idiom regardless.
+    if (Object.prototype.hasOwnProperty.call(map, language)) {
+      (map as unknown as Record<string, unknown>)[language] = path;
+    }
   }
   return map;
 }
@@ -264,23 +302,41 @@ export class ExecdBackend implements ExecBackend {
   }
 
   #runtimeCache: RuntimeMap | undefined;
+  /**
+   * The in-flight probe, if one is running. `detectRuntimes()` is async, so
+   * two callers can both see an empty `#runtimeCache` before either has had
+   * a chance to populate it — e.g. two concurrent `ctx_execute` calls racing
+   * their first use of a freshly constructed `ExecdBackend`. Sharing this
+   * promise means the second caller awaits the first caller's probe instead
+   * of launching a redundant one: the round-trip budget this class exists to
+   * hold is "one", not "one per concurrent caller".
+   */
+  #runtimeProbe: Promise<RuntimeMap> | undefined;
 
-  detectRuntimes(): RuntimeMap {
+  async detectRuntimes(): Promise<RuntimeMap> {
     if (this.#runtimeCache) return this.#runtimeCache;
-    let stdout = "";
+    if (!this.#runtimeProbe) {
+      this.#runtimeProbe = this.#probeRuntimes().then((map) => {
+        this.#runtimeCache = map;
+        return map;
+      });
+    }
+    return this.#runtimeProbe;
+  }
+
+  async #probeRuntimes(): Promise<RuntimeMap> {
     try {
-      stdout = execFileSync(
+      const { stdout } = await execFileAsync(
         "agent-sandbox",
         ["exec", "--", buildRuntimeProbeScript()],
-        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+        { encoding: "utf-8", timeout: 30_000 },
       );
+      return parseRuntimeProbeOutput(stdout);
     } catch {
       // An unreachable execd, a refused probe, a missing binary: report no
       // runtimes rather than throwing. Every execution path fails with execd's
       // own message anyway, which says more than anything invented here.
-      stdout = "";
+      return parseRuntimeProbeOutput("");
     }
-    this.#runtimeCache = parseRuntimeProbeOutput(stdout);
-    return this.#runtimeCache;
   }
 }

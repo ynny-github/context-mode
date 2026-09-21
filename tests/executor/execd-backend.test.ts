@@ -326,6 +326,21 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
   });
 });
 
+// INVARIANT: this describe block must stay the LAST one in this file.
+//
+// Its nested beforeAll/afterAll swap the on-disk agent-sandbox fake from the
+// probe-aware FAKE (used by every describe block above) to PLAIN_FAKE for
+// the duration of these tests, then swap the probe-aware FAKE back. That
+// restore is what keeps the swap safe — but nothing enforces it running.
+// vitest runs a file's describe blocks in declaration order and this file
+// has nothing declared after this block, so there is currently no test that
+// could observe the wrong fake if the restore were skipped (a thrown
+// afterAll, a killed process). Adding a describe block below this one would
+// silently inherit PLAIN_FAKE — no probe special-casing, so any test there
+// that goes through PolyglotExecutor.execute() (like the "through #spawn"
+// suite above) would fail the same way Step 5 broke this file before the
+// harness was made probe-aware. If a block ever needs to go after this one,
+// give it its own local fake swap rather than relying on this one's cleanup.
 describe.skipIf(process.platform === "win32")("ExecdBackend.detectRuntimes", () => {
   // These tests exercise the probe itself directly — including making it
   // fail — so they need FAKE_STDOUT/FAKE_EXIT/FAKE_STDERR to drive the
@@ -345,32 +360,53 @@ describe.skipIf(process.platform === "win32")("ExecdBackend.detectRuntimes", () 
     writeFileSync(scriptPath, probeAwareFake, { mode: 0o755 });
   });
 
-  test("probes every runtime in a single agent-sandbox invocation", () => {
+  test("probes every runtime in a single agent-sandbox invocation", async () => {
     reset();
     // The fake replies with a probe result for two languages and nothing else.
     process.env.FAKE_STDOUT = "javascript\t/usr/bin/node\npython\t/usr/bin/python3\n";
     const backend = new ExecdBackend("/run/fake-execd.sock");
-    const map = backend.detectRuntimes();
+    const map = await backend.detectRuntimes();
     expect(map.javascript).toBe("/usr/bin/node");
     expect(map.python).toBe("/usr/bin/python3");
     expect(map.ruby).toBeNull();
     expect(calls().length).toBe(1);
   });
 
-  test("caches, so a second call costs no further round trip", () => {
+  test("caches, so a second call costs no further round trip", async () => {
     reset();
     process.env.FAKE_STDOUT = "javascript\t/usr/bin/node\n";
     const backend = new ExecdBackend("/run/fake-execd.sock");
-    backend.detectRuntimes();
-    backend.detectRuntimes();
+    await backend.detectRuntimes();
+    await backend.detectRuntimes();
     expect(calls().length).toBe(1);
   });
 
-  test("a probe that fails yields a map with no runtimes rather than throwing", () => {
+  // detectRuntimes() is async, so two callers can both observe an empty
+  // cache before either has populated it — e.g. two concurrent ctx_execute
+  // calls racing their first use of a freshly constructed ExecdBackend.
+  // Without sharing the in-flight probe, both would launch their own
+  // agent-sandbox invocation, breaking the "one round trip" guarantee under
+  // exactly the concurrency this async conversion introduced. Started
+  // together (not awaited individually first) so both observe the cache
+  // empty, which is what makes this test actually exercise the race rather
+  // than two sequential, already-cached calls.
+  test("concurrent first calls share a single in-flight probe", async () => {
+    reset();
+    process.env.FAKE_STDOUT = "javascript\t/usr/bin/node\n";
+    const backend = new ExecdBackend("/run/fake-execd.sock");
+    const [a, b] = await Promise.all([
+      backend.detectRuntimes(),
+      backend.detectRuntimes(),
+    ]);
+    expect(a).toEqual(b);
+    expect(calls().length).toBe(1);
+  });
+
+  test("a probe that fails yields a map with no runtimes rather than throwing", async () => {
     reset();
     process.env.FAKE_EXIT = "1";
     process.env.FAKE_STDERR = "agent-sandbox: exec daemon is not available";
-    const map = new ExecdBackend("/run/fake-execd.sock").detectRuntimes();
+    const map = await new ExecdBackend("/run/fake-execd.sock").detectRuntimes();
     expect(map.javascript).toBeNull();
     expect(map.python).toBeNull();
   });

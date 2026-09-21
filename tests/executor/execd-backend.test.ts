@@ -276,9 +276,15 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
   // running the binary — neither of which is `execute()`'s single call into
   // `#runViaBackend`. This is the only place that proves both go through the
   // backend too: the fake never actually compiles anything, so this is host-
-  // independent even on a machine with no rustc at all. Runtime detection is
-  // overridden rather than relying on `detectRuntimes()` finding a real
-  // `rustc` for the same reason.
+  // independent even on a machine with no rustc at all. The `runtimes: {
+  // ..., rust: "rustc" }` passed to the constructor below is NOT what makes
+  // this host-independent, and is not even consulted: under ExecdBackend,
+  // execute() resolves runtimes by calling `backend.detectRuntimes()`
+  // instead of using the constructor-injected map (see execute()'s comment
+  // on "Detection must happen where execution happens"). What actually makes
+  // this host-independent is the probe-aware FAKE above answering every
+  // probe with its own fixed, healthy map — including a canned `rust` entry
+  // — regardless of what's really installed.
   //
   // The fake's default exit is 0 (`reset()` deletes FAKE_EXIT, and the fake
   // computes `Number(process.env.FAKE_EXIT || "0")`), so the "compile" call
@@ -402,12 +408,36 @@ describe.skipIf(process.platform === "win32")("ExecdBackend.detectRuntimes", () 
     expect(calls().length).toBe(1);
   });
 
-  test("a probe that fails yields a map with no runtimes rather than throwing", async () => {
+  // Reversed from the original design: a failed probe used to yield a map
+  // with no runtimes (shell defaulting to "sh") rather than throwing, on the
+  // theory that every execution path then fails with execd's own message.
+  // That theory didn't hold — buildCommand() speaks first, with a message
+  // naming the wrong machine — and the "sh" default let ctx_batch_execute
+  // appear to keep working while silently running under the wrong shell. See
+  // the design doc's "Error handling" section.
+  test("a probe that fails throws a distinct, actionable error carrying execd's stderr", async () => {
     reset();
     process.env.FAKE_EXIT = "1";
     process.env.FAKE_STDERR = "agent-sandbox: exec daemon is not available";
-    const map = await new ExecdBackend("/run/fake-execd.sock").detectRuntimes();
-    expect(map.javascript).toBeNull();
-    expect(map.python).toBeNull();
+    await expect(
+      new ExecdBackend("/run/fake-execd.sock").detectRuntimes(),
+    ).rejects.toThrow(/exec daemon is not available/);
+  });
+
+  test("a failed probe is not cached, so the next call retries rather than rejecting forever", async () => {
+    reset();
+    process.env.FAKE_EXIT = "1";
+    process.env.FAKE_STDERR = "agent-sandbox: exec daemon is not available";
+    const backend = new ExecdBackend("/run/fake-execd.sock");
+    await expect(backend.detectRuntimes()).rejects.toThrow();
+    expect(calls().length).toBe(1);
+
+    // A second call after the first has failed must launch its own probe
+    // rather than reusing a rejected in-flight promise forever.
+    process.env.FAKE_EXIT = "0";
+    process.env.FAKE_STDOUT = "javascript\t/usr/bin/node\n";
+    const map = await backend.detectRuntimes();
+    expect(map.javascript).toBe("/usr/bin/node");
+    expect(calls().length).toBe(2);
   });
 });

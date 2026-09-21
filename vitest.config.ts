@@ -5,6 +5,14 @@ const isCI = !!process.env.CI;
 export default defineConfig({
   test: {
     include: ["tests/**/*.test.ts"],
+    // Runs before every test file in a worker. Currently just pins
+    // CONTEXT_MODE_EXEC_BACKEND unset so an ambient export from a
+    // developer's shell can't silently reroute ~140 executor tests onto the
+    // execd backend — see tests/setup-env.ts for the full rationale. This is
+    // the repo's first global setup file; there was no prior convention
+    // (tests/setup-home.ts is opt-in per suite, not global — see its own
+    // comment for why).
+    setupFiles: ["./tests/setup-env.ts"],
     testTimeout: 30_000,
     // afterAll cleanup loops over many better-sqlite3 handles on Windows
     // and can exceed vitest's default 10s hookTimeout under fork contention

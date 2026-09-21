@@ -1593,6 +1593,17 @@ That blocks loopback + RFC1918 + ULA in addition to the always-blocked ranges. U
 
 `tool_input` for any `mcp__*` tool call is also redacted before persistence — the regex matcher in `hooks/posttooluse.mjs` masks `authorization`, `auth_token`, `access_token`, `refresh_token`, `bearer`, `token`, `secret`, `password`, `passwd`, `pwd`, `api_key` / `apikey` / `x_api_key`, `cookie` / `set-cookie`, `signature`, `private_key`, and `client_secret` (case-insensitive, hyphen/underscore-insensitive) to `[REDACTED]` so credentials in MCP arguments don't end up in the session DB.
 
+### Execution backend (fork-only)
+
+`ctx_execute`, `ctx_execute_file` and `ctx_batch_execute` normally spawn agent-authored code directly in this MCP server's own process, inheriting whatever the host sandbox granted it. In a fork setup built around `agent-sandbox` — where a `PreToolUse` hook already routes Claude's own `Bash`/`Monitor` calls through `agent-sandbox exec` so they run under an operator-controlled command profile — an MCP server is outside that hook's reach by design, so its execution stayed on the agent side of that boundary. These two variables close that gap by giving the executor a second backend:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `CONTEXT_MODE_EXEC_BACKEND` | unset (`local`) | Selects where a command actually runs. Unset or `"local"`: today's behaviour, spawned in this process. `"execd"`: every command is handed to `agent-sandbox exec` instead, which routes it through `execd` — a sibling `agent-sandbox` session — to run under the operator's command profile rather than this process's own sandbox grants. Any other value, or `"execd"` with no socket variable set, fails server startup outright — there is no silent fallback to `local`. |
+| `AGENT_SANDBOX_EXECD_SOCKET` | unset | Read-only; context-mode never sets this itself. Published by an `agent-sandbox claude` session and inherited by the MCP server it spawns as a child process. Required when `CONTEXT_MODE_EXEC_BACKEND=execd`. |
+
+**The one hole deliberately left open: `ctx_fetch_and_index`.** That tool never routes through either backend — it always runs its HTTP fetch locally, in this process, regardless of `CONTEXT_MODE_EXEC_BACKEND`. Stated plainly and without softening: **its network egress is not bound by the command profile's `network.allow_domain`, and runs with the agent sandbox's own grants.** It's narrower than "arbitrary agent code with agent grants" though — the code that runs is server-generated JS, not agent-supplied code, and an agent-supplied URL still passes through the SSRF guard described above before any request is made. What's actually ungated is *which domains it's allowed to reach*, not *what code executes*.
+
 ### Storage environment variables
 
 | Variable | Default | Purpose |

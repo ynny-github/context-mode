@@ -362,10 +362,13 @@ export class PolyglotExecutor {
         return rustResult;
       }
 
-      // Every language runs in the project directory so git, relative paths,
-      // and other project-aware tools resolve naturally. The script FILE lives
-      // in the sandbox tmpDir and is passed to the runtime by absolute path
-      // (see buildCommand), so cwd is free to be the project root.
+      // Every language EXCEPT rust (handled above, which runs #compileAndRun
+      // in tmpDir — a known, deliberately unfixed divergence; see the design
+      // doc's "Known issue, deliberately not fixed here") runs in the project
+      // directory so git, relative paths, and other project-aware tools
+      // resolve naturally. The script FILE lives in the sandbox tmpDir and is
+      // passed to the runtime by absolute path (see buildCommand), so cwd is
+      // free to be the project root.
       //
       // Issue #788 — previously only `shell` used the project root; non-shell
       // runtimes (python/js/ts/…) used tmpDir, so repo-relative checks like

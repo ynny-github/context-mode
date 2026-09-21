@@ -1,11 +1,18 @@
 import { describe, test, expect } from "vitest";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import {
   quoteForPosixShell,
   quoteArgvAsCommandLine,
 } from "../src/shell-quote.js";
-import { LocalBackend, ExecdBackend, EXECD_TIMEOUT_GRACE_MS } from "../src/exec-backend.js";
+import {
+  LocalBackend,
+  ExecdBackend,
+  EXECD_TIMEOUT_GRACE_MS,
+  buildRuntimeProbeScript,
+  parseRuntimeProbeOutput,
+} from "../src/exec-backend.js";
 import { buildShellScriptContent } from "../src/executor.js";
 import type { ExecResult } from "../src/types.js";
 
@@ -63,6 +70,39 @@ describe("quoteArgvAsCommandLine round trip through a real shell", () => {
         const out = execFileSync("/bin/sh", ["-c", line], { encoding: "utf-8" });
         expect(out).toBe(argv[2] + "\n");
       }
+    },
+  );
+});
+
+// buildRuntimeProbeScript() is a plain string, so a unit test on the string
+// itself cannot catch a bug in how a real shell interprets it. On this repo's
+// own host (no dotnet-script on PATH, which is the normal case), the
+// unfixed generator produced a `;`-joined line whose LAST candidate loop
+// (csharp/dotnet-script) exits non-zero because nothing satisfies it, and
+// that becomes the whole line's exit status — even though every other
+// language that could be found, was. That made `execFileAsync` in
+// `#probeRuntimes()` reject a perfectly good stdout and discard it, so a real
+// `execute()` call under ExecdBackend threw "No JavaScript runtime
+// available…" on every normal host. The fix terminates the line with an
+// explicit `exit 0` so the probe's own exit status only reflects whether the
+// probe could be RUN at all, not which languages it happened to find.
+describe("buildRuntimeProbeScript through a real shell", () => {
+  test.skipIf(process.platform === "win32")(
+    "exits 0 and its output parses into a map with at least a shell entry",
+    () => {
+      const script = buildRuntimeProbeScript();
+      const result = execFileSync("/bin/sh", ["-c", script], {
+        encoding: "utf-8",
+      });
+      // execFileSync throws on a non-zero exit, so simply not throwing here
+      // is itself part of what's being asserted — a redundant explicit check
+      // makes that intent visible rather than implicit in "didn't throw".
+      const map = parseRuntimeProbeOutput(result);
+      // `shell` always resolves: every POSIX host running this test has at
+      // least `sh`, and EXECD_PROBE_TARGETS lists both `bash` and `sh` as
+      // candidates.
+      expect(typeof map.shell).toBe("string");
+      expect(map.shell).not.toBe("");
     },
   );
 });
@@ -253,17 +293,35 @@ describe("PATH injection", () => {
   });
 });
 
+// Recursively lists every `.ts` file under `dir`, relative-to-cwd paths, so
+// both containment tests below actually match what their titles claim
+// ("any MCP tool schema") instead of a hardcoded subset that misses schemas
+// living in src/adapters/openclaw/mcp-tools.ts, src/adapters/pi/mcp-bridge.ts
+// and src/adapters/opencode/plugin.ts.
+function listTsFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...listTsFiles(full));
+    } else if (entry.isFile() && entry.name.endsWith(".ts")) {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
 describe("backendOverride containment", () => {
   // The exemption is deliberate but it is still a hole: ctx_fetch_and_index
   // performs agent-supplied network egress with the agent sandbox's grants.
   // One call site is the whole of it, and growth must be noticed here rather
   // than in a review six months from now.
+  //
+  // Globs src/**/*.ts (rather than a hand-picked list of files) so the test
+  // actually matches its own claim of "exactly one production call site" —
+  // containment does hold repo-wide today, so this should stay green.
   test("exactly one production call site sets backendOverride", () => {
-    const sources = [
-      "src/server.ts",
-      "src/executor.ts",
-      "src/cli.ts",
-    ].map(p => readFileSync(p, "utf-8"));
+    const sources = listTsFiles("src").map(p => readFileSync(p, "utf-8"));
     const uses = sources.join("\n").split("\n")
       .filter(l => l.includes("backendOverride:"));
     expect(uses.length).toBe(1);
@@ -274,29 +332,61 @@ describe("backendOverride containment", () => {
     // An agent able to name its own backend could choose "local" and step
     // around the sandbox, so this must never reach a tool's input schema.
     //
-    // Tool schemas in this codebase are built with Zod (`z.object({ ... })`,
-    // fields like `z.string()`/`z.enum([...])`), not hand-written JSON
-    // Schema literals — a plain grep for `backendOverride` + `type:` would
-    // never match a Zod field declaration and would pass even if someone
-    // added `backendOverride: z.enum(["local"]).optional()` to a tool's
-    // inputSchema. So this checks every source line that mentions the
-    // property and requires each one to be either the sanctioned call site
-    // (`backendOverride: "local"`, a plain string literal, not a validator
-    // call) or a comment — never a schema field declaration.
-    const server = readFileSync("src/server.ts", "utf-8");
-    const mentions = server.split("\n").filter(l => l.includes("backendOverride"));
+    // Tool schemas in this codebase are NOT all built the same way: server.ts
+    // uses Zod (`z.object({ ... })`, fields like `z.string()`/`z.enum([...])`),
+    // but src/adapters/openclaw/mcp-tools.ts hand-rolls its own JSON-Schema-
+    // like `OpenClawToolParameters` object instead — so a check for the Zod
+    // shape alone (`backendOverride: z.enum(...)`) would pass even if someone
+    // added `backendOverride: { type: "string" }` to that file's `properties`.
+    // So this checks every source line that mentions the property and
+    // requires each one to be one of a short, explicit allowlist — never an
+    // unrecognised shape, which is what a new schema field would be.
+    //
+    // Schemas live in more than src/server.ts — src/adapters/openclaw/
+    // mcp-tools.ts, src/adapters/pi/mcp-bridge.ts and src/adapters/opencode/
+    // plugin.ts all declare or forward tool schemas of their own — so this
+    // globs every .ts file under src/ to actually match the title's claim of
+    // "any", rather than a hand-picked subset that could miss one.
+    const files = listTsFiles("src");
+    const mentions = files.flatMap((path) => {
+      const content = readFileSync(path, "utf-8");
+      return content.split("\n")
+        .filter(l => l.includes("backendOverride"))
+        .map(line => ({ path, line }));
+    });
     expect(mentions.length).toBeGreaterThan(0); // sanity: the property exists at all
 
-    for (const line of mentions) {
+    for (const { path, line } of mentions) {
       const trimmed = line.trim();
       const isComment = trimmed.startsWith("//") || trimmed.startsWith("*");
+      // The one place backendOverride is actually set: a plain string
+      // literal, not a validator call.
       const isSanctionedCallSite = /backendOverride:\s*"local"\s*,?\s*$/.test(trimmed);
-      expect(isComment || isSanctionedCallSite).toBe(true);
+      // The seam's own type declaration in ExecuteOptions
+      // (src/executor.ts) — `backendOverride?: "local";`. Note the `?`
+      // right after the name: this is deliberately a DIFFERENT pattern from
+      // isSanctionedCallSite above (which requires "backendOverride:" with
+      // no "?"), so a schema field written as `backendOverride?: z.enum(...)`
+      // would not slip through by matching this instead.
+      const isTypeDeclaration = /^backendOverride\?:\s*"local";?\s*$/.test(trimmed);
+      // The seam's own internal read of the field — `opts.backendOverride`
+      // in execute(). A property READ can't be a schema declaration; the
+      // `(?!\s*:)` keeps this from also matching a hypothetical
+      // `.backendOverride: ...` schema-field shorthand.
+      const isInternalRead = /\.backendOverride\b(?!\s*:)/.test(trimmed);
+      expect(
+        isComment || isSanctionedCallSite || isTypeDeclaration || isInternalRead,
+        `unexpected backendOverride mention in ${path}: ${line}`,
+      ).toBe(true);
     }
 
-    // Explicit belt-and-suspenders: no Zod validator (or any function call)
-    // is ever attached to the key — that would mean it became a schema field.
+    // Explicit belt-and-suspenders for the Zod-schema files specifically: no
+    // validator (or any function call) is ever attached to the key — that
+    // would mean it became a schema field.
     const schemaFieldPattern = /backendOverride\s*:\s*z\.\w+\(/;
-    expect(server.split("\n").some(l => schemaFieldPattern.test(l))).toBe(false);
+    const hasSchemaField = files.some((path) =>
+      readFileSync(path, "utf-8").split("\n").some(l => schemaFieldPattern.test(l)),
+    );
+    expect(hasSchemaField).toBe(false);
   });
 });

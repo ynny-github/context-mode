@@ -153,8 +153,8 @@ export const EXECD_EXIT_TIMEOUT = 124;
  * runtime — the same rule `buildCommand()` in src/runtime.ts applies.
  *
  * This is deliberately *not* a full mirror of local detection
- * (`detectRuntimes()` in src/runtime.ts). Two things local detection honours
- * are left out on purpose, not by oversight:
+ * (`detectRuntimes()` in src/runtime.ts). Several things local detection does
+ * are left out or done differently here, not by oversight:
  *
  * - `$SHELL`: local detection lets the user's `$SHELL` override the shell
  *   candidate. That variable describes the *agent sandbox's* environment —
@@ -164,6 +164,21 @@ export const EXECD_EXIT_TIMEOUT = 124;
  * - `py`: local detection's Windows Python launcher fallback. execd targets a
  *   nono/Linux command sandbox, where `py` doesn't exist and couldn't mean
  *   anything.
+ * - Python is checked with a bare `command -v` here; local detection uses
+ *   `runnableExists`, which additionally runs `<cmd> --version` to filter out
+ *   non-functional stubs (e.g. the Windows Store's Python alias). The probe
+ *   has no way to run a second command per candidate without giving up the
+ *   one-round-trip property, so it accepts `command -v`'s weaker guarantee.
+ * - Bun is checked with a bare `command -v bun` here; local detection's
+ *   `bunExists()`/`bunCommand()` additionally probes `bun --version` to
+ *   confirm it's >= 1.0 and falls back to well-known install paths when
+ *   `bun` isn't on PATH at all. The probe does neither.
+ * - Local detection's resolved values are mostly *bare command names*
+ *   (`"python3"`, `"bash"`, `"rustc"`, …) — whatever the caller's own PATH
+ *   resolves them to at spawn time. The probe's values are the *absolute
+ *   paths* `command -v` printed on the far side, because that's what a
+ *   `RuntimeMap` entry from this backend has to mean: a path meaningful in
+ *   execd's environment, not this process's.
  */
 const EXECD_PROBE_TARGETS: Array<[keyof RuntimeMap, string[]]> = [
   ["javascript", ["bun", "node"]],
@@ -185,18 +200,46 @@ const EXECD_PROBE_TARGETS: Array<[keyof RuntimeMap, string[]]> = [
  * for the first hit per language. One round trip for the whole map: probing
  * language by language would be twelve `agent-sandbox exec` invocations, each
  * paying a connection and a nono command launch.
+ *
+ * Exported for testing: this is a plain string, so nothing in this file
+ * proves it actually behaves as intended in a real shell (exit status,
+ * output shape) — see the round-trip test in tests/exec-backend.test.ts,
+ * which runs it through `/bin/sh` the same way the argv-quoting round trip
+ * does.
  */
-function buildRuntimeProbeScript(): string {
-  return EXECD_PROBE_TARGETS.map(([language, candidates]) => {
-    const body = candidates
+export function buildRuntimeProbeScript(): string {
+  const body = EXECD_PROBE_TARGETS.map(([language, candidates]) => {
+    const inner = candidates
       .map(c => `p=$(command -v ${c} 2>/dev/null) && ` +
                 `{ printf '${language}\\t%s\\n' "$p"; break; }`)
       .join("; ");
-    return `for _ in 1; do ${body}; done`;
+    return `for _ in 1; do ${inner}; done`;
   }).join("; ");
+  // Each per-language `for` loop's own exit status is meaningless noise, but
+  // in a `;`-joined line the LAST command's status becomes the whole line's
+  // status — and the last target here is csharp/dotnet-script, absent on
+  // essentially every host. Without this, a completely normal probe run
+  // (every language that could be found, was) exits non-zero just because
+  // the final loop found nothing, and `execFileAsync` rejects a perfectly
+  // good result. Terminate with `exit 0` explicitly so only a real inability
+  // to run the probe at all (agent-sandbox missing, execd unreachable, a
+  // genuine script error) produces a non-zero exit.
+  return `${body}; exit 0`;
 }
 
-/** Every language absent — what a failed probe reports. */
+/**
+ * Baseline map `parseRuntimeProbeOutput` starts from before overlaying what
+ * the probe actually found: every language absent except `shell`, which
+ * defaults to `"sh"` — POSIX guarantees a `sh`, mirroring LocalBackend's own
+ * bash-or-sh fallback. This is what an empty (or partially empty) probe
+ * *result* looks like, i.e. a probe that ran but found nothing for some
+ * languages. It is NOT what a failed probe reports — a probe that could not
+ * be run at all (execd unreachable, agent-sandbox missing) now throws
+ * instead of returning this map; see `ExecdBackend#probeRuntimes`. Returning
+ * this on failure was the original design and was reversed: `shell: "sh"`
+ * let a failure masquerade as a working backend silently running under the
+ * wrong shell.
+ */
 function emptyRuntimeMap(): RuntimeMap {
   return {
     javascript: null, typescript: null, python: null, shell: "sh",
@@ -316,27 +359,69 @@ export class ExecdBackend implements ExecBackend {
   async detectRuntimes(): Promise<RuntimeMap> {
     if (this.#runtimeCache) return this.#runtimeCache;
     if (!this.#runtimeProbe) {
-      this.#runtimeProbe = this.#probeRuntimes().then((map) => {
-        this.#runtimeCache = map;
-        return map;
-      });
+      this.#runtimeProbe = this.#probeRuntimes()
+        .then((map) => {
+          this.#runtimeCache = map;
+          return map;
+        })
+        .catch((err) => {
+          // Only a *successful* probe is worth caching (see the field doc
+          // above) — and that means this in-flight slot must not linger
+          // either. Left set, every later caller would await this same
+          // already-rejected promise forever, which disables every
+          // non-shell language until the process restarts even though the
+          // failure (an execd hiccup, a momentarily unreachable socket) may
+          // have been entirely transient. Clearing it here means the next
+          // call starts a fresh probe; callers already awaiting THIS probe
+          // still correctly see it fail — only concurrent-first-call
+          // sharing for a probe already in flight is preserved, not sharing
+          // of a failure across separate calls.
+          this.#runtimeProbe = undefined;
+          throw err;
+        });
     }
     return this.#runtimeProbe;
   }
 
   async #probeRuntimes(): Promise<RuntimeMap> {
+    let stdout: string;
     try {
-      const { stdout } = await execFileAsync(
+      ({ stdout } = await execFileAsync(
         "agent-sandbox",
         ["exec", "--", buildRuntimeProbeScript()],
         { encoding: "utf-8", timeout: 30_000 },
+      ));
+    } catch (err) {
+      // The probe script itself always exits 0 (see buildRuntimeProbeScript),
+      // so landing here means agent-sandbox/execd failed to run it at all —
+      // an unreachable socket, a refused command, agent-sandbox missing from
+      // PATH (ENOENT). Node's execFile rejection still carries whatever the
+      // child wrote before failing; use it rather than discarding it, since
+      // stderr is normally where execd's own reason for the refusal lives.
+      const execErr = err as NodeJS.ErrnoException & {
+        stdout?: string;
+        stderr?: string;
+      };
+      const detail =
+        execErr.stderr?.trim() || execErr.stdout?.trim() || execErr.message;
+      // Thrown, not reported as "every language absent": buildCommand() in
+      // src/runtime.ts would otherwise be the first thing to speak, with a
+      // message naming a runtime and prescribing "Install Node.js or Bun on
+      // PATH" — correct for LocalBackend, but naming the wrong machine here
+      // and prescribing a fix that cannot work on this side of the execd
+      // boundary. execd's own message would never surface at all. Naming
+      // execd as the failing component here, with execd's own stderr
+      // attached, is what actually delivers "the message tells the agent
+      // retrying will not help" (see the design doc's Error handling
+      // section) instead of a misleading local invention.
+      throw new Error(
+        `Failed to detect runtimes through execd: ${detail}. This means ` +
+        `execd itself could not run the detection probe (not that a ` +
+        `specific language is unavailable) — check that the agent-sandbox ` +
+        `session is still up and AGENT_SANDBOX_EXECD_SOCKET points at a ` +
+        `live socket.`,
       );
-      return parseRuntimeProbeOutput(stdout);
-    } catch {
-      // An unreachable execd, a refused probe, a missing binary: report no
-      // runtimes rather than throwing. Every execution path fails with execd's
-      // own message anyway, which says more than anything invented here.
-      return parseRuntimeProbeOutput("");
     }
+    return parseRuntimeProbeOutput(stdout);
   }
 }

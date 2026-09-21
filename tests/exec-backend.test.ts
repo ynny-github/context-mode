@@ -97,3 +97,43 @@ describe("LocalBackend", () => {
     expect(backend.interpret(RAW, 10_000, 5000)).toEqual(RAW);
   });
 });
+
+import { resolveBackendConfig } from "../src/exec-backend.js";
+
+describe("resolveBackendConfig", () => {
+  test("unset selects local", () => {
+    expect(resolveBackendConfig({})).toEqual({ kind: "local" });
+  });
+
+  test('explicit "local" selects local', () => {
+    expect(resolveBackendConfig({ CONTEXT_MODE_EXEC_BACKEND: "local" }))
+      .toEqual({ kind: "local" });
+  });
+
+  test('"execd" with a socket selects execd and carries the path', () => {
+    expect(resolveBackendConfig({
+      CONTEXT_MODE_EXEC_BACKEND: "execd",
+      AGENT_SANDBOX_EXECD_SOCKET: "/run/execd.sock",
+    })).toEqual({ kind: "execd", socketPath: "/run/execd.sock" });
+  });
+
+  // The two below are the whole of fail-closed. They assert that NO fallback
+  // happens — a silent downgrade to local is the exact failure this design
+  // exists to prevent, so these must never be relaxed into a warning.
+  test('"execd" without a socket throws rather than falling back', () => {
+    expect(() => resolveBackendConfig({ CONTEXT_MODE_EXEC_BACKEND: "execd" }))
+      .toThrow(/AGENT_SANDBOX_EXECD_SOCKET/);
+  });
+
+  test("an unknown value throws rather than falling back", () => {
+    expect(() => resolveBackendConfig({ CONTEXT_MODE_EXEC_BACKEND: "brokerr" }))
+      .toThrow(/brokerr/);
+  });
+
+  test("an empty socket value is treated as absent", () => {
+    expect(() => resolveBackendConfig({
+      CONTEXT_MODE_EXEC_BACKEND: "execd",
+      AGENT_SANDBOX_EXECD_SOCKET: "",
+    })).toThrow(/AGENT_SANDBOX_EXECD_SOCKET/);
+  });
+});

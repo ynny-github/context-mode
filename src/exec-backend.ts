@@ -70,3 +70,45 @@ export class LocalBackend implements ExecBackend {
     return detectRuntimes();
   }
 }
+
+/** The environment variable that selects the backend. */
+export const BACKEND_ENV_VAR = "CONTEXT_MODE_EXEC_BACKEND";
+/** agent-sandbox publishes the execd socket path here; we only read it. */
+export const EXECD_SOCKET_ENV_VAR = "AGENT_SANDBOX_EXECD_SOCKET";
+
+export type BackendConfig =
+  | { kind: "local" }
+  | { kind: "execd"; socketPath: string };
+
+/**
+ * Decide the backend from configuration alone. There is deliberately no
+ * auto-detection: the presence of the execd socket does not by itself change
+ * where commands run, because a backend that turns itself on is a backend
+ * nobody audited.
+ *
+ * Every failure here throws. Falling back to "local" on a typo would silently
+ * run agent-authored code with the agent sandbox's own grants, which is the
+ * exact hole this backend exists to close.
+ */
+export function resolveBackendConfig(env: NodeJS.ProcessEnv): BackendConfig {
+  const selected = env[BACKEND_ENV_VAR];
+  if (selected === undefined || selected === "" || selected === "local") {
+    return { kind: "local" };
+  }
+  if (selected === "execd") {
+    const socketPath = env[EXECD_SOCKET_ENV_VAR];
+    if (!socketPath) {
+      throw new Error(
+        `${BACKEND_ENV_VAR}=execd, but ${EXECD_SOCKET_ENV_VAR} is not set. ` +
+        `The execd socket is published by an \`agent-sandbox claude\` session ` +
+        `and inherited by the MCP server it spawns. Refusing to fall back to ` +
+        `local execution, which would run commands outside the command profile.`,
+      );
+    }
+    return { kind: "execd", socketPath };
+  }
+  throw new Error(
+    `${BACKEND_ENV_VAR}=${JSON.stringify(selected)} is not a known backend. ` +
+    `Use "local" or "execd". Refusing to fall back to local execution.`,
+  );
+}

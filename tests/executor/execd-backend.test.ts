@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PolyglotExecutor } from "../../src/executor.js";
 import { detectRuntimes } from "../../src/runtime.js";
+import { ExecdBackend } from "../../src/exec-backend.js";
 
 // A recording stand-in for `agent-sandbox`. It writes its own argv and cwd to
 // $FAKE_LOG, then behaves as the test asks via three env vars. This exercises
@@ -14,7 +15,60 @@ import { detectRuntimes } from "../../src/runtime.js";
 // NOT exercise the byte cap or a non-backgrounded call's process-tree kill
 // (killTree): no test here pushes output past the cap or lets a bounded
 // call's local timer fire before the process exits on its own.
+//
+// Probe-aware: since Step 5, `execute()` resolves runtimes by calling
+// `backend.detectRuntimes()` first, which sends its own `agent-sandbox exec`
+// invocation (a one-line shell script containing `command -v`) ahead of the
+// "real" one under test. If that probe were answered with whatever
+// FAKE_STDOUT/FAKE_EXIT a test set for the real call, it would parse to an
+// empty (or failed) runtime map and `buildCommand()` would throw before the
+// real call ever ran. So a probe — detected by `command -v` appearing in its
+// command line — is answered with a fixed, healthy runtime map and exit 0,
+// unconditionally, regardless of FAKE_STDOUT/FAKE_EXIT/FAKE_STDERR. A
+// non-probe call keeps today's behaviour exactly. The probe is still logged
+// to FAKE_LOG (so a regression that drops the probe, or that lets it leak
+// into the real call, is still observable) — see `calls()`'s doc comment for
+// how each suite accounts for it.
 const FAKE = `#!/usr/bin/env node
+const fs = require("fs");
+const argv = process.argv.slice(2);
+fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({
+  argv,
+  cwd: process.cwd(),
+}) + "\\n");
+const isProbe = argv.some((a) => a.includes("command -v"));
+if (isProbe) {
+  process.stdout.write([
+    "javascript\\t/usr/bin/node",
+    "typescript\\t/usr/bin/node",
+    "python\\t/usr/bin/python3",
+    "shell\\t/bin/bash",
+    "ruby\\t/usr/bin/ruby",
+    "go\\t/usr/bin/go",
+    "rust\\t/usr/bin/rustc",
+    "php\\t/usr/bin/php",
+    "perl\\t/usr/bin/perl",
+    "r\\t/usr/bin/Rscript",
+    "elixir\\t/usr/bin/elixir",
+    "csharp\\t/usr/bin/dotnet-script",
+    "",
+  ].join("\\n"));
+  process.exit(0);
+}
+if (process.env.FAKE_STDOUT) process.stdout.write(process.env.FAKE_STDOUT);
+if (process.env.FAKE_STDERR) process.stderr.write(process.env.FAKE_STDERR);
+const delay = Number(process.env.FAKE_DELAY_MS || "0");
+const code = Number(process.env.FAKE_EXIT || "0");
+if (delay > 0) setTimeout(() => process.exit(code), delay);
+else process.exit(code);
+`;
+
+// Today's plain fake, with no probe special-casing — FAKE_STDOUT/FAKE_EXIT/
+// FAKE_STDERR drive every invocation's response unconditionally. Swapped in
+// for the `ExecdBackend.detectRuntimes` describe block below, whose tests
+// exercise the probe itself and need direct control over what it returns
+// (including making it fail) rather than the canned response above.
+const PLAIN_FAKE = `#!/usr/bin/env node
 const fs = require("fs");
 fs.appendFileSync(process.env.FAKE_LOG, JSON.stringify({
   argv: process.argv.slice(2),
@@ -29,14 +83,15 @@ else process.exit(code);
 `;
 
 let binDir: string;
+let scriptPath: string;
 let logPath: string;
 let originalPath: string | undefined;
 
 beforeAll(() => {
   binDir = mkdtempSync(join(tmpdir(), "ctx-fake-as-"));
   logPath = join(binDir, "calls.log");
-  const script = join(binDir, "agent-sandbox");
-  writeFileSync(script, FAKE, { mode: 0o755 });
+  scriptPath = join(binDir, "agent-sandbox");
+  writeFileSync(scriptPath, FAKE, { mode: 0o755 });
   originalPath = process.env.PATH;
   process.env.PATH = `${binDir}:${originalPath ?? ""}`;
   process.env.FAKE_LOG = logPath;
@@ -49,6 +104,14 @@ afterAll(() => {
   rmSync(binDir, { recursive: true, force: true });
 });
 
+// Raw, unfiltered log of every `agent-sandbox` invocation — including the
+// runtime-detection probe `execute()` now issues before the real call. Kept
+// unfiltered (rather than hiding the probe here) because the
+// `ExecdBackend.detectRuntimes` suite below calls this same helper to assert
+// on the probe itself. In the "through #spawn" suite below, index 0 is
+// always the probe — each test there builds a fresh executor, so the cache
+// is empty and exactly one probe precedes the real call(s); tests account
+// for that leading entry explicitly (see the comments at each call site).
 function calls(): Array<{ argv: string[]; cwd: string }> {
   if (!existsSync(logPath)) return [];
   return readFileSync(logPath, "utf-8").trim().split("\n")
@@ -85,7 +148,14 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
       code: "console.log('ignored — the fake never runs it')",
       timeout: 4000,
     });
-    const [call] = calls();
+    // Index 0 is the runtime-detection probe execute() now issues before
+    // the real call (its own agent-sandbox invocation, containing
+    // "command -v"). Asserted explicitly here — rather than just skipping
+    // ahead to index 1 — so a regression that drops the probe entirely, or
+    // that lets a probe answer leak into the real call's slot, still fails
+    // this test instead of being silently absorbed by the index shift.
+    const [probe, call] = calls();
+    expect(probe.argv.some(a => a.includes("command -v"))).toBe(true);
     expect(call.argv[0]).toBe("exec");
     expect(call.argv).toContain("--timeout");
     expect(call.argv[call.argv.indexOf("--timeout") + 1]).toBe("4000ms");
@@ -110,8 +180,10 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
       }).execute({ language: "javascript", code: "", timeout: 4000 });
       // realpath both sides so a symlinked temp root (macOS /var ->
       // /private/var, or any other host-specific symlinking) doesn't cause a
-      // false mismatch.
-      expect(realpathSync(calls()[0].cwd)).toBe(realpathSync(projectRoot));
+      // false mismatch. calls()[0] is the runtime-detection probe (run with
+      // no explicit cwd, so it reflects wherever the test process happens to
+      // be), not the real call — calls()[1] is the one that ran in cwd.
+      expect(realpathSync(calls()[1].cwd)).toBe(realpathSync(projectRoot));
     } finally {
       rmSync(projectRoot, { recursive: true, force: true });
     }
@@ -189,7 +261,9 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
       const r = await bgExecutor.execute({
         language: "javascript", code: "", timeout: 300, background: true,
       });
-      const [call] = calls();
+      // calls()[0] is the runtime-detection probe; the background call under
+      // test is calls()[1].
+      const [, call] = calls();
       expect(call.argv).not.toContain("--timeout");
       expect(r.timedOut).toBe(true);
       expect(r.backgrounded).toBe(true);
@@ -226,9 +300,11 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
     });
     expect(r.exitCode).toBe(0);
 
+    // recorded[0] is the runtime-detection probe execute() issues before
+    // #compileAndRun's own two calls (compile, then run) — three total.
     const recorded = calls();
-    expect(recorded).toHaveLength(2);
-    const [compileCall, runCall] = recorded;
+    expect(recorded).toHaveLength(3);
+    const [, compileCall, runCall] = recorded;
 
     // Both calls went through `agent-sandbox exec -- …`, quoted, exactly
     // like every other language — not a bare `rustc`/binary spawn.
@@ -247,5 +323,55 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
     const runLine = runCall.argv[runCall.argv.length - 1];
     expect(runLine).toMatch(/^'.*\/script'$/);
     expect(runLine).not.toContain("rustc");
+  });
+});
+
+describe.skipIf(process.platform === "win32")("ExecdBackend.detectRuntimes", () => {
+  // These tests exercise the probe itself directly — including making it
+  // fail — so they need FAKE_STDOUT/FAKE_EXIT/FAKE_STDERR to drive the
+  // probe's response unconditionally, which is exactly PLAIN_FAKE's
+  // behaviour (today's fake, with no probe special-casing). Swap it in for
+  // the duration of this describe block only; restore the probe-aware FAKE
+  // on the way out so it doesn't leak into other test files reusing binDir's
+  // PATH entry within the same run.
+  let probeAwareFake: string;
+
+  beforeAll(() => {
+    probeAwareFake = readFileSync(scriptPath, "utf-8");
+    writeFileSync(scriptPath, PLAIN_FAKE, { mode: 0o755 });
+  });
+
+  afterAll(() => {
+    writeFileSync(scriptPath, probeAwareFake, { mode: 0o755 });
+  });
+
+  test("probes every runtime in a single agent-sandbox invocation", () => {
+    reset();
+    // The fake replies with a probe result for two languages and nothing else.
+    process.env.FAKE_STDOUT = "javascript\t/usr/bin/node\npython\t/usr/bin/python3\n";
+    const backend = new ExecdBackend("/run/fake-execd.sock");
+    const map = backend.detectRuntimes();
+    expect(map.javascript).toBe("/usr/bin/node");
+    expect(map.python).toBe("/usr/bin/python3");
+    expect(map.ruby).toBeNull();
+    expect(calls().length).toBe(1);
+  });
+
+  test("caches, so a second call costs no further round trip", () => {
+    reset();
+    process.env.FAKE_STDOUT = "javascript\t/usr/bin/node\n";
+    const backend = new ExecdBackend("/run/fake-execd.sock");
+    backend.detectRuntimes();
+    backend.detectRuntimes();
+    expect(calls().length).toBe(1);
+  });
+
+  test("a probe that fails yields a map with no runtimes rather than throwing", () => {
+    reset();
+    process.env.FAKE_EXIT = "1";
+    process.env.FAKE_STDERR = "agent-sandbox: exec daemon is not available";
+    const map = new ExecdBackend("/run/fake-execd.sock").detectRuntimes();
+    expect(map.javascript).toBeNull();
+    expect(map.python).toBeNull();
   });
 });

@@ -341,8 +341,17 @@ export class PolyglotExecutor {
 
     try {
       const backend = this.#pickBackend(opts.backendOverride);
-      const filePath = this.#writeScript(tmpDir, code, language, backend.kind === "local");
-      const cmd = buildCommand(this.#runtimes, language, filePath);
+      // Detection must happen where execution happens. Under ExecdBackend the
+      // runtimes on this side say nothing about the ones on the other, so
+      // #writeScript (which reads runtimes.shell) and buildCommand both need
+      // the backend's own map, resolved before the script is written.
+      const runtimes = backend.kind === "local"
+        ? this.#runtimes
+        : backend.detectRuntimes();
+      const filePath = this.#writeScript(
+        tmpDir, code, language, backend.kind === "local", runtimes,
+      );
+      const cmd = buildCommand(runtimes, language, filePath);
 
       // Rust: compile then run. Assigned rather than returned — returning here
       // skipped cleanupTmpDir below, leaving the source and the compiled
@@ -392,7 +401,13 @@ export class PolyglotExecutor {
     return this.execute({ language, code: wrappedCode, timeout });
   }
 
-  #writeScript(tmpDir: string, code: string, language: Language, injectPath: boolean): string {
+  #writeScript(
+    tmpDir: string,
+    code: string,
+    language: Language,
+    injectPath: boolean,
+    runtimes: RuntimeMap,
+  ): string {
     // Go needs a main package wrapper if not present
     if (language === "go" && !code.includes("package ")) {
       code = `package main\n\nimport "fmt"\n\nfunc main() {\n${code}\n}\n`;
@@ -414,11 +429,11 @@ export class PolyglotExecutor {
       buildScriptFilename(
         language,
         process.platform,
-        language === "shell" ? this.#runtimes.shell : null,
+        language === "shell" ? runtimes.shell : null,
       ),
     );
     if (language === "shell") {
-      const shellPath = this.#runtimes.shell;
+      const shellPath = runtimes.shell;
       // #782 — on Windows Git Bash, rewrite bare `mvn` → `mvn.cmd` so Maven
       // uses its native Windows launcher (correct path handling) instead of
       // the broken mingw shell branch. No-op on non-Windows.

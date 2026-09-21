@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { detectRuntimes, type RuntimeMap } from "./runtime.js";
 import type { ExecResult } from "./types.js";
 import { quoteArgvAsCommandLine } from "./shell-quote.js";
@@ -128,6 +129,62 @@ export const EXECD_TIMEOUT_GRACE_MS = 5000;
 export const EXECD_EXIT_TIMEOUT = 124;
 
 /**
+ * The commands each language is satisfied by, in preference order. Mirrors
+ * `buildCommand()`'s expectations in src/runtime.ts: the first name that
+ * resolves wins, and the resolved absolute path becomes the runtime.
+ */
+const EXECD_PROBE_TARGETS: Array<[keyof RuntimeMap, string[]]> = [
+  ["javascript", ["bun", "node"]],
+  ["typescript", ["bun", "tsx", "ts-node"]],
+  ["python", ["python3", "python"]],
+  ["shell", ["bash", "sh"]],
+  ["ruby", ["ruby"]],
+  ["go", ["go"]],
+  ["rust", ["rustc"]],
+  ["php", ["php"]],
+  ["perl", ["perl"]],
+  ["r", ["Rscript"]],
+  ["elixir", ["elixir"]],
+  ["csharp", ["dotnet-script"]],
+];
+
+/**
+ * One shell line that resolves every candidate and prints `<language>\t<path>`
+ * for the first hit per language. One round trip for the whole map: probing
+ * language by language would be twelve `agent-sandbox exec` invocations, each
+ * paying a connection and a nono command launch.
+ */
+function buildRuntimeProbeScript(): string {
+  return EXECD_PROBE_TARGETS.map(([language, candidates]) => {
+    const body = candidates
+      .map(c => `p=$(command -v ${c} 2>/dev/null) && ` +
+                `{ printf '${language}\\t%s\\n' "$p"; break; }`)
+      .join("; ");
+    return `for _ in 1; do ${body}; done`;
+  }).join("; ");
+}
+
+/** Every language absent — what a failed probe reports. */
+function emptyRuntimeMap(): RuntimeMap {
+  return {
+    javascript: null, typescript: null, python: null, shell: "sh",
+    ruby: null, go: null, rust: null, php: null, perl: null, r: null,
+    elixir: null, csharp: null,
+  };
+}
+
+/** Parse `<language>\t<path>` lines into a RuntimeMap. */
+export function parseRuntimeProbeOutput(stdout: string): RuntimeMap {
+  const map = emptyRuntimeMap();
+  for (const line of stdout.split("\n")) {
+    const [language, path] = line.split("\t");
+    if (!language || !path) continue;
+    if (language in map) (map as unknown as Record<string, unknown>)[language] = path;
+  }
+  return map;
+}
+
+/**
  * Runs each command through `agent-sandbox exec`, so it executes under the
  * operator's nono command profile instead of this process's own sandbox.
  *
@@ -206,10 +263,24 @@ export class ExecdBackend implements ExecBackend {
     return raw;
   }
 
+  #runtimeCache: RuntimeMap | undefined;
+
   detectRuntimes(): RuntimeMap {
-    // Replaced in a later task with detection performed through execd. Until
-    // then this is local detection, which is wrong for this backend but no
-    // more wrong than before this class existed.
-    return detectRuntimes();
+    if (this.#runtimeCache) return this.#runtimeCache;
+    let stdout = "";
+    try {
+      stdout = execFileSync(
+        "agent-sandbox",
+        ["exec", "--", buildRuntimeProbeScript()],
+        { encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"], timeout: 30_000 },
+      );
+    } catch {
+      // An unreachable execd, a refused probe, a missing binary: report no
+      // runtimes rather than throwing. Every execution path fails with execd's
+      // own message anyway, which says more than anything invented here.
+      stdout = "";
+    }
+    this.#runtimeCache = parseRuntimeProbeOutput(stdout);
+    return this.#runtimeCache;
   }
 }

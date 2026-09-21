@@ -8,6 +8,7 @@ import {
   type RuntimeMap,
   type Language,
 } from "./runtime.js";
+import { quoteForPosixShell } from "./shell-quote.js";
 export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
 
@@ -58,10 +59,6 @@ export function buildScriptFilename(
  */
 export function buildSpawnOptions(platform: NodeJS.Platform): { windowsHide: boolean } {
   return { windowsHide: platform === "win32" };
-}
-
-function quoteForPosixShell(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 /** Pure helper — exported for unit testing. Restores parent PATH after shell startup. */

@@ -38,10 +38,15 @@ const hasWorkingRust = hasWorkingRustc();
  * for exactly this reason.
  *
  * Rust is the only language whose generated script file is named
- * `script.rs`, and no other concurrently-scheduled test runs rust, so a
- * sibling test's dir can never match this filter even if it's still present
- * at snapshot time — it never contains `script.rs`. A before/after diff of
- * THIS set is still needed on top of that, though: the two tests below run
+ * `script.rs`, so a non-rust sibling test's dir can never match this filter
+ * even if it's still present at snapshot time — it never contains
+ * `script.rs`. One sibling does run rust —
+ * `tests/executor.test.ts`'s rust `execute_file` case — so this filter is
+ * not immune to *that* one specifically; the residual race is narrow (that
+ * case cleans up its own tmp dir promptly on both the success and failure
+ * paths, same as the fix under test here does) and repeated back-to-back
+ * combined runs of both files found no flake. A before/after diff of THIS
+ * set is still needed on top of that, though: the two tests below run
  * against a real filesystem that can carry leaked `script.rs` dirs left over
  * from earlier (pre-fix) runs of this very suite, and those must not be
  * blamed on the run currently under test.

@@ -197,4 +197,55 @@ describe.skipIf(process.platform === "win32")("ExecdBackend through #spawn", () 
       bgExecutor.cleanupBackgrounded();
     }
   }, 10_000);
+
+  // `#compileAndRun` (rust) has two spawn sites of its own — compiling, then
+  // running the binary — neither of which is `execute()`'s single call into
+  // `#runViaBackend`. This is the only place that proves both go through the
+  // backend too: the fake never actually compiles anything, so this is host-
+  // independent even on a machine with no rustc at all. Runtime detection is
+  // overridden rather than relying on `detectRuntimes()` finding a real
+  // `rustc` for the same reason.
+  //
+  // The fake's default exit is 0 (`reset()` deletes FAKE_EXIT, and the fake
+  // computes `Number(process.env.FAKE_EXIT || "0")`), so the "compile" call
+  // reports success without being asked to — which is exactly what's needed
+  // here, since `#compileAndRun` only issues the second (run) call when the
+  // first (compile) call's exitCode is 0.
+  test("rust compiles and runs through agent-sandbox exec, not a direct execFileSync/#spawn", async () => {
+    const executor = new PolyglotExecutor({
+      runtimes: { ...detectRuntimes(), rust: "rustc" },
+      env: {
+        CONTEXT_MODE_EXEC_BACKEND: "execd",
+        AGENT_SANDBOX_EXECD_SOCKET: "/run/fake-execd.sock",
+      },
+    });
+    const r = await executor.execute({
+      language: "rust",
+      code: `fn main() { println!("42"); }`,
+      timeout: 4000,
+    });
+    expect(r.exitCode).toBe(0);
+
+    const recorded = calls();
+    expect(recorded).toHaveLength(2);
+    const [compileCall, runCall] = recorded;
+
+    // Both calls went through `agent-sandbox exec -- …`, quoted, exactly
+    // like every other language — not a bare `rustc`/binary spawn.
+    for (const call of [compileCall, runCall]) {
+      expect(call.argv[0]).toBe("exec");
+      expect(call.argv).toContain("--timeout");
+      expect(call.argv[call.argv.indexOf("--timeout") + 1]).toBe("4000ms");
+      expect(call.argv[call.argv.length - 2]).toBe("--");
+    }
+
+    // First call: `rustc <script.rs> -o <binary>`.
+    const compileLine = compileCall.argv[compileCall.argv.length - 1];
+    expect(compileLine).toMatch(/^'rustc' '.*\/script\.rs' '-o' '.*\/script'$/);
+
+    // Second call: the compiled binary, invoked alone.
+    const runLine = runCall.argv[runCall.argv.length - 1];
+    expect(runLine).toMatch(/^'.*\/script'$/);
+    expect(runLine).not.toContain("rustc");
+  });
 });

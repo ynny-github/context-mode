@@ -4,6 +4,8 @@ import {
   quoteForPosixShell,
   quoteArgvAsCommandLine,
 } from "../src/shell-quote.js";
+import { LocalBackend } from "../src/exec-backend.js";
+import type { ExecResult } from "../src/types.js";
 
 describe("quoteArgvAsCommandLine", () => {
   test("joins a plain argv", () => {
@@ -61,4 +63,37 @@ describe("quoteArgvAsCommandLine round trip through a real shell", () => {
       }
     },
   );
+});
+
+const RAW: ExecResult = {
+  stdout: "out", stderr: "err", exitCode: 7, timedOut: false,
+};
+
+describe("LocalBackend", () => {
+  const backend = new LocalBackend();
+
+  test("kind is local", () => {
+    expect(backend.kind).toBe("local");
+  });
+
+  test("prepare passes the argv through untouched", () => {
+    const argv = ["node", "/tmp/a b/x.js"];
+    expect(backend.prepare(argv, 5000, false)).toEqual({
+      argv: ["node", "/tmp/a b/x.js"],
+      spawnTimeout: 5000,
+    });
+  });
+
+  test("prepare preserves an absent timeout as absent", () => {
+    expect(backend.prepare(["node"], undefined, false).spawnTimeout)
+      .toBeUndefined();
+  });
+
+  test("background changes nothing locally", () => {
+    expect(backend.prepare(["node"], 5000, true).spawnTimeout).toBe(5000);
+  });
+
+  test("interpret passes the result through untouched", () => {
+    expect(backend.interpret(RAW, 10_000, 5000)).toEqual(RAW);
+  });
 });

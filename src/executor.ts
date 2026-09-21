@@ -9,6 +9,7 @@ import {
   type Language,
 } from "./runtime.js";
 import { quoteForPosixShell } from "./shell-quote.js";
+import { LocalBackend, type ExecBackend } from "./exec-backend.js";
 export type { ExecResult } from "./types.js";
 import type { ExecResult } from "./types.js";
 
@@ -240,6 +241,27 @@ export class PolyglotExecutor {
   /** PIDs of backgrounded processes — killed on cleanup to prevent zombies. */
   #backgroundedPids = new Set<number>();
 
+  /**
+   * Both backends are held at once rather than one being swapped in: a single
+   * call site (ctx_fetch_and_index) is pinned to `local` permanently, so the
+   * choice is per call, not per process.
+   */
+  #backends: { local: ExecBackend; execd?: ExecBackend } = { local: new LocalBackend() };
+  #defaultBackend: "local" | "execd" = "local";
+
+  #pickBackend(override?: "local"): ExecBackend {
+    if (override === "local") return this.#backends.local;
+    if (this.#defaultBackend === "execd") {
+      const execd = this.#backends.execd;
+      // Unreachable: #defaultBackend is only set to "execd" alongside the
+      // backend itself. Throwing rather than falling back keeps the failure
+      // closed if that invariant is ever broken.
+      if (!execd) throw new Error("execd backend selected but not constructed");
+      return execd;
+    }
+    return this.#backends.local;
+  }
+
   constructor(opts?: {
     hardCapBytes?: number;
     projectRoot?: string | (() => string);
@@ -301,7 +323,9 @@ export class PolyglotExecutor {
       // Issue #45 — `cwdOverride` lets per-call sites (Codex MCP handlers) pin
       // cwd without mutating process-wide state.
       const cwd = cwdOverride ?? this.#projectRoot;
-      const result = await this.#spawn(cmd, cwd, tmpDir, timeout, background);
+      const result = await this.#runViaBackend(
+        this.#pickBackend(), cmd, cwd, tmpDir, timeout, background,
+      );
 
       // Skip tmpDir cleanup if process was backgrounded — it may still need files
       if (!result.backgrounded) {
@@ -401,6 +425,26 @@ export class PolyglotExecutor {
 
     // Run
     return this.#spawn([binPath], cwd, cwd, timeout);
+  }
+
+  /**
+   * prepare → spawn → interpret. The one path from an argv to an ExecResult,
+   * so a backend cannot be bypassed by a second spawn site.
+   */
+  async #runViaBackend(
+    backend: ExecBackend,
+    argv: string[],
+    cwd: string,
+    sandboxTmpDir: string,
+    timeout: number | undefined,
+    background = false,
+  ): Promise<ExecResult> {
+    const prepared = backend.prepare(argv, timeout, background);
+    const started = Date.now();
+    const raw = await this.#spawn(
+      prepared.argv, cwd, sandboxTmpDir, prepared.spawnTimeout, background,
+    );
+    return backend.interpret(raw, Date.now() - started, timeout);
   }
 
   async #spawn(
